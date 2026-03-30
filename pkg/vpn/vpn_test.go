@@ -23,7 +23,7 @@ type tunPacket struct {
 // TestWGConnectSurfshark connects to Surfshark WireGuard.
 // Usage: go test ./pkg/vpn/... -v -run TestWGConnectSurfshark -timeout 120s
 func TestWGConnectSurfshark(t *testing.T) {
-	confFile := "../../id-jak (1).conf"
+	confFile := "../../wireguard.conf"
 	cfg := config.NewConfig(config.WithConfigFile(confFile))
 	runWGTest(t, cfg)
 }

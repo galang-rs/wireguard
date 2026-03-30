@@ -89,7 +89,18 @@ func parseInterfaceOption(opts *WireGuardOptions, key, value string) error {
 		}
 		opts.PrivateKey = k
 	case "address":
-		opts.Address = value
+		// Handle dual-stack addresses: "172.16.0.2/32, 2606:4700::1/128"
+		parts := strings.Split(value, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				opts.Addresses = append(opts.Addresses, p)
+			}
+		}
+		// Primary address = first entry (typically IPv4)
+		if len(opts.Addresses) > 0 {
+			opts.Address = opts.Addresses[0]
+		}
 	case "dns":
 		parts := strings.Split(value, ",")
 		for _, p := range parts {

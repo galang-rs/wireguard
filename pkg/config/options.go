@@ -13,7 +13,8 @@ var ErrBadConfig = errors.New("wireguard: bad config")
 type WireGuardOptions struct {
 	// Interface section
 	PrivateKey [32]byte
-	Address    string   // e.g. "10.0.0.2/24"
+	Address    string   // primary address, e.g. "10.0.0.2/24" (first from dual-stack)
+	Addresses  []string // all addresses, e.g. ["172.16.0.2/32", "2606:4700::1/128"]
 	DNS        []string // e.g. ["1.1.1.1", "8.8.8.8"]
 	MTU        int      // e.g. 1420
 
