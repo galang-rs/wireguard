@@ -156,6 +156,15 @@ func (ws *muxerWorkerState) demuxWorker() {
 			ws.logger.Infof("%s: ← received %s (%d bytes)", workerName, domain.MessageTypeString(msgType), len(rawBytes))
 
 			switch msgType {
+			case domain.MessageInitiation:
+				// Peer-initiated re-key: route to handshake service.
+				ws.logger.Infof("%s: peer initiated re-key handshake", workerName)
+				select {
+				case ws.muxerToHandshake <- rawBytes:
+				case <-ws.workersManager.ShouldShutdown():
+					return
+				}
+
 			case domain.MessageResponse:
 				// Stop retry timer
 				if retryTicker != nil {

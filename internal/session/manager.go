@@ -366,6 +366,175 @@ func (m *Manager) ConsumeResponse(data []byte) (*crypto.KeyPair, error) {
 	return kp, nil
 }
 
+// ConsumeInitiation processes an incoming handshake initiation from the peer
+// (responder side of Noise IKpsk2). Returns a response message and derived keypair.
+//
+// Protocol steps (responder consuming initiation):
+//   Ci := HASH(CONSTRUCTION)
+//   Hi := HASH(Ci || IDENTIFIER)
+//   Hi := HASH(Hi || Spubr)         -- our public key is the "responder" here
+//   Ci := KDF1(Ci, msg.ephemeral)
+//   Hi := HASH(Hi || msg.ephemeral)
+//   (Ci, κ) := KDF2(Ci, DH(Sprivi, msg.ephemeral))   -- static-ephemeral
+//   AEAD-Open(κ, 0, msg.static, Hi) → peer_pubkey     -- decrypt peer's static
+//   Hi := HASH(Hi || msg.static)
+//   (Ci, κ) := KDF2(Ci, DH(Sprivi, peer_pubkey))      -- static-static
+//   AEAD-Open(κ, 0, msg.timestamp, Hi) → timestamp     -- decrypt timestamp
+//   Hi := HASH(Hi || msg.timestamp)
+func (m *Manager) ConsumeInitiation(data []byte) ([]byte, *crypto.KeyPair, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	msg, err := domain.ParseHandshakeInitiation(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session: parse initiation: %w", err)
+	}
+
+	hs := &Handshake{}
+	hs.chainingKey = crypto.InitialChainingKey
+	hs.hash = crypto.InitialHash
+	hs.remoteIndex = msg.SenderIndex
+
+	// Hi := HASH(Hi || Spubi)  -- our public key (we are the responder)
+	crypto.MixHash(&hs.hash, m.localPublic[:])
+
+	// Ci := KDF1(Ci, msg.ephemeral)
+	hs.chainingKey = crypto.KDF1(hs.chainingKey[:], msg.Ephemeral[:])
+
+	// Hi := HASH(Hi || msg.ephemeral)
+	crypto.MixHash(&hs.hash, msg.Ephemeral[:])
+
+	// (Ci, κ) := KDF2(Ci, DH(Sprivi, msg.ephemeral))  -- se
+	var peerEphemeral [crypto.KeySize]byte
+	copy(peerEphemeral[:], msg.Ephemeral[:])
+	ss, err := crypto.DH(m.localPrivate, peerEphemeral)
+	if err != nil {
+		return nil, nil, fmt.Errorf("DH se: %w", err)
+	}
+	key := crypto.MixKey(&hs.chainingKey, ss[:])
+
+	// Decrypt static: AEAD-Open(κ, 0, msg.static, Hi) → peer_pubkey
+	peerStaticRaw, err := crypto.AEADDecrypt(key, 0, msg.Static[:], hs.hash[:])
+	if err != nil {
+		return nil, nil, fmt.Errorf("session: decrypt static: %w", err)
+	}
+	var peerStatic [crypto.KeySize]byte
+	copy(peerStatic[:], peerStaticRaw)
+
+	// Verify peer public key matches what we expect
+	if peerStatic != m.peerPublic {
+		return nil, nil, fmt.Errorf("session: peer public key mismatch in initiation")
+	}
+
+	// Hi := HASH(Hi || msg.static)
+	crypto.MixHash(&hs.hash, msg.Static[:])
+
+	// (Ci, κ) := KDF2(Ci, DH(Sprivi, peer_pubkey))  -- ss
+	ss, err = crypto.DH(m.localPrivate, peerStatic)
+	if err != nil {
+		return nil, nil, fmt.Errorf("DH ss: %w", err)
+	}
+	key = crypto.MixKey(&hs.chainingKey, ss[:])
+
+	// Decrypt timestamp: AEAD-Open(κ, 0, msg.timestamp, Hi)
+	_, err = crypto.AEADDecrypt(key, 0, msg.Timestamp[:], hs.hash[:])
+	if err != nil {
+		return nil, nil, fmt.Errorf("session: decrypt timestamp: %w", err)
+	}
+
+	// Hi := HASH(Hi || msg.timestamp)
+	crypto.MixHash(&hs.hash, msg.Timestamp[:])
+
+	// --- Now create the response ---
+
+	// Generate our ephemeral key pair
+	hs.localEphemPrivate, hs.localEphemPublic, err = crypto.GenerateKeyPair()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate ephemeral: %w", err)
+	}
+
+	// Generate random sender index
+	var indexBuf [4]byte
+	if _, err := rand.Read(indexBuf[:]); err != nil {
+		return nil, nil, err
+	}
+	hs.localIndex = binary.LittleEndian.Uint32(indexBuf[:])
+
+	resp := &domain.HandshakeResponse{
+		SenderIndex:   hs.localIndex,
+		ReceiverIndex: hs.remoteIndex,
+	}
+
+	// Hi := HASH(Hi || msg.ephemeral)
+	copy(resp.Ephemeral[:], hs.localEphemPublic[:])
+	crypto.MixHash(&hs.hash, resp.Ephemeral[:])
+
+	// Ci := KDF1(Ci, msg.ephemeral)
+	hs.chainingKey = crypto.KDF1(hs.chainingKey[:], resp.Ephemeral[:])
+
+	// (Ci, κ) := KDF2(Ci, DH(Eprivi, Epubr))  -- ee
+	ss, err = crypto.DH(hs.localEphemPrivate, peerEphemeral)
+	if err != nil {
+		return nil, nil, fmt.Errorf("DH ee: %w", err)
+	}
+	key = crypto.MixKey(&hs.chainingKey, ss[:])
+	_ = key
+
+	// (Ci, κ) := KDF2(Ci, DH(Eprivi, Spubr))  -- es
+	ss, err = crypto.DH(hs.localEphemPrivate, peerStatic)
+	if err != nil {
+		return nil, nil, fmt.Errorf("DH es: %w", err)
+	}
+	key = crypto.MixKey(&hs.chainingKey, ss[:])
+	_ = key
+
+	// (Ci, τ, κ) := KDF3(Ci, Q)  -- PSK
+	psk := m.presharedKey
+	if !m.hasPSK {
+		psk = [32]byte{}
+	}
+	t1, t2, t3 := crypto.KDF3(hs.chainingKey[:], psk[:])
+	hs.chainingKey = t1
+	crypto.MixHash(&hs.hash, t2[:])
+	key = t3
+
+	// msg.empty := AEAD(κ, 0, ε, Hi)
+	emptyEnc, err := crypto.AEADEncrypt(key, 0, nil, hs.hash[:])
+	if err != nil {
+		return nil, nil, fmt.Errorf("encrypt empty: %w", err)
+	}
+	copy(resp.Empty[:], emptyEnc)
+
+	// Hi := HASH(Hi || msg.empty)
+	crypto.MixHash(&hs.hash, resp.Empty[:])
+
+	// Derive transport keys: (Trecv, Tsend) := KDF2(Ci, ε)
+	// Note: responder's send = initiator's recv, so keys are swapped
+	recvKey, sendKey := crypto.KDF2(hs.chainingKey[:], nil)
+
+	kp := &crypto.KeyPair{
+		SendKey:     sendKey,
+		RecvKey:     recvKey,
+		LocalIndex:  hs.localIndex,
+		RemoteIndex: hs.remoteIndex,
+	}
+
+	// Serialize response
+	buf := resp.MarshalBinary()
+
+	// Compute MAC1: mac1 = MAC(HASH(LABEL_MAC1 || Spubr), msg[0:60])
+	mac1Key := crypto.MAC1Key(m.peerPublic)
+	mac1 := crypto.ComputeMAC1(mac1Key, buf[:60])
+	copy(buf[60:76], mac1[:])
+	// MAC2 is zero (no cookie)
+
+	m.handshake = hs
+	m.activeKeyPair = kp
+
+	m.logger.Infof("session: consumed initiation, created response (local=%d, remote=%d)", kp.LocalIndex, kp.RemoteIndex)
+	return buf, kp, nil
+}
+
 // Handshake holds the in-progress handshake state.
 type Handshake struct {
 	chainingKey       [crypto.HashSize]byte

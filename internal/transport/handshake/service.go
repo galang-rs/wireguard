@@ -99,6 +99,35 @@ func (ws *handshakeWorkerState) mainWorker() {
 					return
 				}
 
+			case domain.MessageInitiation:
+				// Peer-initiated re-key: consume initiation and send response.
+				ws.logger.Infof("%s: processing peer-initiated re-key", workerName)
+				respBytes, kp, err := ws.session.ConsumeInitiation(data)
+				if err != nil {
+					ws.logger.Errorf("%s: consume initiation: %s", workerName, err)
+					continue
+				}
+
+				// Send response to network.
+				select {
+				case ws.handshakeOrDataToMuxer <- respBytes:
+					ws.logger.Infof("%s: sent handshake response (%d bytes)", workerName, len(respBytes))
+				case <-ws.workersManager.ShouldShutdown():
+					return
+				}
+
+				// Send keepalive to confirm.
+				ws.sendKeepalive(kp)
+
+				// Deliver new keypair to data service.
+				select {
+				case ws.keyReady <- kp:
+					ws.session.SetState(domain.StateEstablished)
+					ws.logger.Infof("%s: re-key complete, new transport keys active", workerName)
+				case <-ws.workersManager.ShouldShutdown():
+					return
+				}
+
 			case domain.MessageCookieReply:
 				ws.logger.Debugf("%s: got cookie reply (TODO: handle retry)", workerName)
 				// In a full implementation, we'd extract the cookie and retry

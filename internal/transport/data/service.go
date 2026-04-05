@@ -69,10 +69,11 @@ func (ws *dataWorkerState) decryptWorker() {
 	}()
 	ws.logger.Debugf("%s: waiting for key", workerName)
 
-	// Wait for key
+	// Wait for initial key
 	select {
 	case kp := <-ws.keyReady:
 		ws.keyPair = kp
+		ws.session.SetActiveKeyPair(kp)
 		ws.logger.Debugf("%s: got key, starting decryption", workerName)
 	case <-ws.workersManager.ShouldShutdown():
 		return
@@ -80,6 +81,12 @@ func (ws *dataWorkerState) decryptWorker() {
 
 	for {
 		select {
+		case kp := <-ws.keyReady:
+			// Re-key: update keypair for both decrypt and encrypt.
+			ws.logger.Infof("%s: re-key: new keypair active (local=%d, remote=%d)", workerName, kp.LocalIndex, kp.RemoteIndex)
+			ws.keyPair = kp
+			ws.session.SetActiveKeyPair(kp)
+
 		case data := <-ws.muxerToData:
 			msg, err := domain.ParseTransportData(data)
 			if err != nil {
@@ -122,8 +129,8 @@ func (ws *dataWorkerState) encryptWorker() {
 	}()
 	ws.logger.Debugf("%s: started", workerName)
 
-	// Wait until decryptWorker has received the keypair
-	for ws.keyPair == nil {
+	// Wait until decryptWorker has received the initial keypair
+	for ws.session.ActiveKeyPair() == nil {
 		select {
 		case <-ws.workersManager.ShouldShutdown():
 			return
@@ -145,15 +152,21 @@ func (ws *dataWorkerState) encryptWorker() {
 	for {
 		select {
 		case ipPacket := <-ws.tunToData:
-			nonce := ws.keyPair.NextSendNonce()
-			ciphertext, err := crypto.AEADEncrypt(ws.keyPair.SendKey, nonce, ipPacket, nil)
+			// Always read latest keypair from session (safe for re-key).
+			kp := ws.session.ActiveKeyPair()
+			if kp == nil {
+				ws.logger.Warnf("%s: no active keypair, dropping packet", workerName)
+				continue
+			}
+			nonce := kp.NextSendNonce()
+			ciphertext, err := crypto.AEADEncrypt(kp.SendKey, nonce, ipPacket, nil)
 			if err != nil {
 				ws.logger.Warnf("%s: encrypt: %s", workerName, err)
 				continue
 			}
 
 			msg := &domain.TransportData{
-				ReceiverIndex: ws.keyPair.RemoteIndex,
+				ReceiverIndex: kp.RemoteIndex,
 				Counter:       nonce,
 				Payload:       ciphertext,
 			}
@@ -168,13 +181,17 @@ func (ws *dataWorkerState) encryptWorker() {
 
 		case <-keepaliveTicker.C:
 			// Send keepalive (empty encrypted packet)
-			nonce := ws.keyPair.NextSendNonce()
-			ciphertext, err := crypto.AEADEncrypt(ws.keyPair.SendKey, nonce, nil, nil)
+			kp := ws.session.ActiveKeyPair()
+			if kp == nil {
+				continue
+			}
+			nonce := kp.NextSendNonce()
+			ciphertext, err := crypto.AEADEncrypt(kp.SendKey, nonce, nil, nil)
 			if err != nil {
 				continue
 			}
 			msg := &domain.TransportData{
-				ReceiverIndex: ws.keyPair.RemoteIndex,
+				ReceiverIndex: kp.RemoteIndex,
 				Counter:       nonce,
 				Payload:       ciphertext,
 			}
